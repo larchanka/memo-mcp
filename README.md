@@ -241,7 +241,20 @@ Returns the top 40 active tags directly for clients that do not support dynamic 
 
 ## 6. Host Setup & Configuration Examples
 
-### Claude Desktop
+### Using via `npx` (Recommended)
+
+```json
+{
+  "mcpServers": {
+    "memo": {
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
+    }
+  }
+}
+```
+
+### Claude Desktop (Local Build)
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
@@ -258,7 +271,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
-### Cursor
+### Cursor (Local Build)
 Add to `.cursor/mcp.json` or Global Cursor Settings:
 
 ```json
