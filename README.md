@@ -241,6 +241,64 @@ Returns the top 40 active tags directly for clients that do not support dynamic 
 
 ## 6. Host Setup & Configuration Examples
 
+### Using via `npx` (Recommended)
+
+```json
+{
+  "mcpServers": {
+    "memo": {
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
+    }
+  }
+}
+```
+
+### Antigravity
+Add to `~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memo": {
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
+    }
+  }
+}
+```
+
+Or point directly to your local build:
+```json
+{
+  "mcpServers": {
+    "memo": {
+      "command": "node",
+      "args": ["/absolute/path/to/memo-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+### OpenCode
+Add to `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "~/.config/opencode/AGENTS.md"
+  ],
+  "mcp": {
+    "memo": {
+      "enabled": true,
+      "type": "local",
+      "command": ["npx", "-y", "@larchanka/memo-mcp"]
+    }
+  }
+}
+```
+
 ### Claude Desktop
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
@@ -248,11 +306,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 {
   "mcpServers": {
     "memo": {
-      "command": "node",
-      "args": ["/absolute/path/to/memo-mcp/dist/index.js"],
-      "env": {
-        "MEMO_DB_PATH": "/Users/username/.memo/memo.db"
-      }
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
     }
   }
 }
@@ -265,11 +320,16 @@ Add to `.cursor/mcp.json` or Global Cursor Settings:
 {
   "mcpServers": {
     "memo": {
-      "command": "node",
-      "args": ["/absolute/path/to/memo-mcp/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
     }
   }
 }
+```
+
+### Claude Code CLI
+```bash
+claude mcp add memo npx -y @larchanka/memo-mcp
 ```
 
 ### Environment Variables
@@ -277,7 +337,38 @@ Add to `.cursor/mcp.json` or Global Cursor Settings:
 
 ---
 
-## 7. Development & Verification
+## 7. Agent Instruction Protocol (`AGENTS.md` / `GEMINI.md`)
+
+To enable autonomous memory retrieval and persistence across coding agents (Antigravity, OpenCode, Claude Code, Cursor), add the following protocol to your project's `AGENTS.md` or global instructions (`~/.gemini/GEMINI.md` / `~/.config/opencode/AGENTS.md`):
+
+```markdown
+### Persistent Memory Protocol (memo-mcp)
+
+1. **Before starting complex architectural tasks, unfamiliar module refactoring, or troubleshooting obscure errors:**
+   - Identify current project context: project name (from `package.json`, root folder name, or git repo) and root path.
+   - Call `search_memory` using technical keywords, optionally including the project name if seeking project-specific context.
+   - If the task relates to project origin, legacy decisions, or returns zero initial hits, re-run with `deep_history: true`.
+   - Inspect the returned preview cards. If a card is directly relevant, call `get_entry_context(entry_id)` to review full code snippets, context, and trade-offs.
+
+2. **At the end of every completed milestone, bugfix, or structural decision:**
+   - Call `append_memory` with explicit project identification:
+     - **Project Context:** Identify project name (e.g. from `package.json`, root folder name, or git repo) and workspace path.
+     - **Summary:** Prefix summary with `[<project-name>]` (e.g., `[memo-mcp] Configured SQLite WAL mode...`).
+     - **Body:** Begin body with a metadata header:
+       ```markdown
+       - **Project:** <project-name>
+       - **Path:** `<workspace-folder-path>`
+       ```
+       followed by the detailed narrative, decisions, trade-offs, or instructions.
+     - **Tags:** Include the sanitized project name as a tag, plus 2-4 semantic tags adhering to known tags from `get_active_tags` (max 6 tags total).
+     - **Type selection:**
+       - Use `type: "decision"` or `type: "architecture"` ONLY for permanent conventions and designs (immune to time decay).
+       - Use `type: "bugfix"` or `type: "note"` for transient implementation quirks or troubleshooting steps (decay with 30-day half-life).
+```
+
+---
+
+## 8. Development & Verification
 
 ### Install Dependencies
 ```bash

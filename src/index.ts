@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
@@ -113,9 +114,19 @@ export async function startServer(dbPath?: string): Promise<void> {
 }
 
 // Auto-start when executed as the CLI entrypoint
-const isDirectExecution =
+const isDirectExecution = Boolean(
   process.argv[1] &&
-  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+    (() => {
+      try {
+        const scriptPath = fileURLToPath(import.meta.url);
+        const resolvedArg = path.resolve(process.argv[1]);
+        if (scriptPath === resolvedArg) return true;
+        return scriptPath === fs.realpathSync(resolvedArg);
+      } catch {
+        return false;
+      }
+    })()
+);
 
 if (isDirectExecution) {
   startServer().catch((error) => {
