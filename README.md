@@ -1,248 +1,42 @@
-# SQLite Persistent Memory MCP Server (`memo-mcp`)
+# memo (`memo-mcp`)
 
-A lightweight, local-first Model Context Protocol (MCP) server providing persistent, cross-agent episodic and architectural memory using pure SQLite in WAL mode.
+> **Your AI agents forget everything between sessions. `memo` gives them a shared, local-first memory — one SQLite file, zero cloud.**
 
 ---
 
-## 1. Problem & Architecture Overview
+### The Fundamental Contrast
 
-When running multiple AI coding agents (Claude Code, Cursor, OpenCode, Codex), shared context between sessions is lost. Dumping conversations into raw vector databases introduces high hallucination risk, token bloat, and poor token-level symbol matching.
+$$\text{AGENTS.md is what humans write. \textbf{memo} is what agents remember.}$$
 
-`memo-mcp` provides an append-only, structured memory bus backed by **SQLite FTS5** and **in-process exponential time-decay scoring**.
+`AGENTS.md` defines static instructions and project boundaries. `memo` accumulates real-world developer experience across sessions: architectural decisions made, tricky toolchain bugs resolved, and library quirks discovered.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       Host Clients                          │
-│               (Cursor / Claude Code / OpenCode)             │
-└───────────────┬─────────────────────────────▲───────────────┘
-                │                             │
- (1) Seed Tags: │ readResource()              │ (2) Read: search_memory()
-     top 40     │                             │           get_entry_context()
-                ▼                             │
-┌─────────────────────────────────────────────┴───────────────┐
-│                      Node.js MCP Server                     │
-│                                                             │
-│  • Memory Append:                                           │
-│    - Soft validation (coerces bad formats to 'note')        │
-│    - Auto-sanitizes tags (lowercase, trim, symbol removal)  │
-│                                                             │
-│  • Two-Stage Retrieval Pipeline:                            │
-│    - FTS5 BM25 raw match (top 30 candidates)                │
-│    - If deep_history == false:                              │
-│        decay = ('decision' | 'architecture') ? 1.0          │
-│                : (0.5) ^ (Δt_days / 30)                     │
-│        score = -bm25 * decay                                │
-│    - If deep_history == true:                               │
-│        score = -bm25 (pure BM25, no age penalty)            │
-│    - Stage 1: Returns lightweight Index Cards (top N)       │
-│    - Stage 2: Deep fetch full Markdown narrative by ID      │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    SQLite Database (WAL)                    │
-│                                                             │
-│  TABLE memory_entries (id, type, summary, body, ...)        │
-│  TABLE keywords (id, keyword UNIQUE)                        │
-│  TABLE memory_tags (entry_id, keyword_id)                   │
-│  VIRTUAL TABLE memory_fts USING fts5(...)                   │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│ SESSION 1 (Claude Code): Solves obscure iOS audio streaming bug        │
+│ └─► Calls append_memory([free-ai-translation-ios-app] Implemented ...) │
+│                                                                        │
+│ ──────────────────────── 2 WEEKS LATER ────────────────────────────── │
+│                                                                        │
+│ SESSION 2 (Cursor / Antigravity): New session, clean context           │
+│ └─► Natural Language Search: "translation pipeline WhisperKit NLLB"   │
+│ └─► Result: Relevant card found in one shot with decayed score         │
+│ └─► Agent reads full context via get_entry_context(51)                 │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. Core Design Principles
+## 30-Second Quickstart
 
-1. **Flat, Non-Hierarchical Tags with Dynamic Seeding:**
-   No rigid directory paths or project silos. The server dynamically extracts the **top 40 active tags** (frequency $\ge 3$ within the last 60 days, backfilled by all-time popular tags) and exposes them via MCP resources/tools to prevent vocabulary fragmentation across agents.
-2. **Append-Only Rolling Log:**
-   Entries are immutable records of decisions, discoveries, and fixes. Eliminates chunk-invalidation race conditions and mutation deadlocks.
-3. **Type-Aware Exponential Decay & Deep Search Toggle:**
-   Recent notes rank higher, preventing stale solutions from crowding the prompt context.
-   - `decision` and `architecture` entries are **permanently immune** to decay ($T_{\text{half}} = \infty$).
-   - `bugfix` and `note` decay with a **30-day half-life**.
-   - Setting `deep_history: true` completely disables decay on demand for historical retrospectives.
-4. **Two-Stage Retrieval (Token Budget Protection):**
-   - **Stage 1 (`search_memory`):** Returns compact preview cards (`id`, `type`, `summary`, `tags`, `age_days`, `score`).
-   - **Stage 2 (`get_entry_context`):** The agent fetches the full Markdown body, rationale, and code snippets only for entries deemed strictly relevant.
-5. **Code-Safe FTS5 Tokenizer (`tokenchars '-_/@'`):**
-   Tokens like `@modelcontextprotocol/sdk`, `src/utils/auth.ts`, and `better-sqlite3` remain indexed as unified terms rather than fragmented into useless single words. Periods (`.`) remain standard delimiters to prevent sentence endings from corrupting token vocabulary.
-6. **Soft-Validation Ingestion:**
-   Malformed agent inputs (missing required fields, invalid types) are automatically coerced into a fallback `type: "note"` rather than throwing fatal validation errors and losing context.
+Add `memo` to your MCP client configuration:
 
----
-
-## 3. Database Schema
-
-The database uses `better-sqlite3` in WAL mode with foreign keys and busy timeout:
-
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
-
--- 1. Main append-only storage
-CREATE TABLE IF NOT EXISTS memory_entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL CHECK(type IN ('decision', 'architecture', 'bugfix', 'note')),
-    summary TEXT NOT NULL,
-    body TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Normalized keywords catalog
-CREATE TABLE IF NOT EXISTS keywords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    keyword TEXT UNIQUE NOT NULL
-);
-
--- 3. Many-to-many junction
-CREATE TABLE IF NOT EXISTS memory_tags (
-    entry_id INTEGER NOT NULL,
-    keyword_id INTEGER NOT NULL,
-    PRIMARY KEY (entry_id, keyword_id),
-    FOREIGN KEY (entry_id) REFERENCES memory_entries(id) ON DELETE CASCADE,
-    FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE CASCADE
-);
-
--- 4. Full-Text Search index with code-safe tokenchars
-CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-    entry_id UNINDEXED,
-    summary,
-    body,
-    tags,
-    tokenize = "unicode61 tokenchars '-_/@'"
-);
+### Claude Code CLI
+```bash
+claude mcp add memo npx -y @larchanka/memo-mcp
 ```
 
----
-
-## 4. Mathematical Scoring Function
-
-In SQLite FTS5, the internal `bm25()` function returns a negative float, where values closer to $-\infty$ indicate higher term match quality:
-
-$$\text{Relevance}_{\text{raw}} = -1 \times \text{bm25}$$
-
-### Time Decay Calculation
-
-$$\Delta t_{\text{days}} = \frac{\text{now} - \text{created\_at}}{86,400,000\text{ ms}}$$
-
-$$\text{DecayMultiplier} = \begin{cases} 1.0 & \text{if } \text{deep\_history} = \text{true} \\ 1.0 & \text{if } \text{type} \in \{\text{'decision'}, \text{'architecture'}\} \\ (0.5)^{\frac{\Delta t_{\text{days}}}{30}} & \text{if } \text{type} \in \{\text{'bugfix'}, \text{'note'}\} \end{cases}$$
-
-$$\text{FinalScore} = \text{Relevance}_{\text{raw}} \times \text{DecayMultiplier}$$
-
----
-
-## 5. MCP Protocol Specification
-
-### Resources
-
-#### `memo://tags/popular`
-- **MIME Type:** `text/plain`
-- **Description:** Newline-delimited list of the top 40 candidate tags calculated using the 60-day rolling window + all-time backfill formula. Injected into agent system prompts on session boot.
-
----
-
-### Tools
-
-#### 1. `append_memory`
-Appends an atomic milestone, bugfix, or architectural decision to the persistent store.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": {
-      "type": "string",
-      "enum": ["decision", "architecture", "bugfix", "note"],
-      "description": "Category. 'decision' and 'architecture' never decay. 'bugfix' and 'note' decay with a 30-day half-life."
-    },
-    "summary": {
-      "type": "string",
-      "description": "A crisp, 1-2 sentence preview card describing the insight or change."
-    },
-    "tags": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Normalized lowercase tags (e.g. ['sqlite', 'wal', 'auth']). Max 6 tags."
-    },
-    "body": {
-      "type": "string",
-      "description": "Detailed Markdown narrative: problem context, trade-offs, code diffs, or instructions."
-    }
-  },
-  "required": ["summary", "tags", "body"]
-}
-```
-
-#### 2. `search_memory` (Stage 1)
-Executes FTS5 token search and returns compact index cards ranked by decayed relevance.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "query": {
-      "type": "string",
-      "description": "Keywords, code symbols, or natural language query (e.g. 'sqlite wal mode concurrent writes')."
-    },
-    "deep_history": {
-      "type": "boolean",
-      "default": false,
-      "description": "Set to true to disable time-decay and search across all historical entries purely by textual relevance."
-    },
-    "limit": {
-      "type": "number",
-      "default": 5,
-      "description": "Max index cards to return (default: 5, max: 15)."
-    }
-  },
-  "required": ["query"]
-}
-```
-
-**Output Format:**
-```json
-[
-  {
-    "id": 42,
-    "type": "architecture",
-    "summary": "Configured SQLite WAL mode with 5000ms busy_timeout for multi-agent writes.",
-    "tags": ["sqlite", "wal", "concurrency"],
-    "age_days": 12,
-    "score": 14.82
-  }
-]
-```
-
-#### 3. `get_entry_context` (Stage 2)
-Retrieves the complete narrative and code snippets for a specific entry ID.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "entry_id": {
-      "type": "number",
-      "description": "The target entry ID obtained from search_memory."
-    }
-  },
-  "required": ["entry_id"]
-}
-```
-
-#### 4. `get_active_tags` (Fallback Tool)
-Returns the top 40 active tags directly for clients that do not support dynamic MCP Resource inspection.
-
----
-
-## 6. Host Setup & Configuration Examples
-
-### Using via `npx` (Recommended)
-
+### Cursor
+Add to `.cursor/mcp.json` or your Global Cursor MCP settings:
 ```json
 {
   "mcpServers": {
@@ -256,7 +50,6 @@ Returns the top 40 active tags directly for clients that do not support dynamic 
 
 ### Antigravity
 Add to `~/.gemini/config/mcp_config.json`:
-
 ```json
 {
   "mcpServers": {
@@ -268,13 +61,14 @@ Add to `~/.gemini/config/mcp_config.json`:
 }
 ```
 
-Or point directly to your local build:
+### Claude Desktop
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 ```json
 {
   "mcpServers": {
     "memo": {
-      "command": "node",
-      "args": ["/absolute/path/to/memo-mcp/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "@larchanka/memo-mcp"]
     }
   }
 }
@@ -282,13 +76,9 @@ Or point directly to your local build:
 
 ### OpenCode
 Add to `~/.config/opencode/opencode.jsonc`:
-
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": [
-    "~/.config/opencode/AGENTS.md"
-  ],
   "mcp": {
     "memo": {
       "enabled": true,
@@ -299,61 +89,50 @@ Add to `~/.config/opencode/opencode.jsonc`:
 }
 ```
 
-### Claude Desktop
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+---
 
-```json
-{
-  "mcpServers": {
-    "memo": {
-      "command": "npx",
-      "args": ["-y", "@larchanka/memo-mcp"]
-    }
-  }
-}
-```
+## Why It's Different
 
-### Cursor
-Add to `.cursor/mcp.json` or Global Cursor Settings:
+Most agent memory projects (Mem0, Zep, Letta, Cognee) require cloud accounts, API keys, external vector databases, or complex background daemons. `memo` takes a fundamentally different engineering approach:
 
-```json
-{
-  "mcpServers": {
-    "memo": {
-      "command": "npx",
-      "args": ["-y", "@larchanka/memo-mcp"]
-    }
-  }
-}
-```
+### 1. Forgetting Is a Feature (Time-Decayed Relevance)
+Stale troubleshooting tips and temporary workarounds pollute context windows. `memo` applies in-process exponential time-decay:
+- **`bugfix` and `note`** decay with a **30-day half-life**. Recent fixes rank high; yesterday's transient workaround naturally fades away.
+- **`decision` and `architecture`** are **permanently immune** to decay ($T_{\text{half}} = \infty$). Core conventions never expire.
+- Need a historical post-mortem? Toggle `deep_history: true` to bypass decay and search purely by textual BM25 relevance.
 
-### Claude Code CLI
-```bash
-claude mcp add memo npx -y @larchanka/memo-mcp
-```
+### 2. Append-Only ADRs (Written by Agents, for Agents)
+Instead of messy raw conversation dumps, agents log structured, atomic records: problem context, trade-offs evaluated, and decisions taken. It's an automated Architecture Decision Record (ADR) system for your codebase.
 
-### Environment Variables
-- `MEMO_DB_PATH`: Custom path to SQLite database file. Defaults to `~/.memo/memo.db`. Parent directories are created automatically.
+### 3. Token-Economy Two-Stage Retrieval
+LLM context windows are expensive. Dumping full documents on every search wastes prompt budget.
+- **Stage 1 (`search_memory`):** Executes fast, disjunctive SQLite FTS5 search and returns compact **preview index cards** (~25 tokens each) containing ID, summary, tags, and decayed score.
+- **Stage 2 (`get_entry_context`):** The agent inspects the cards and pulls the full Markdown body and code snippets **only** for the exact entries it needs.
+
+### 4. One SQLite File. Zero Cloud.
+- Stored locally in WAL mode at `~/.memo/memo.db` (configurable via `MEMO_DB_PATH`).
+- No external vector DB, no embeddings bill, no daemon processes, zero telemetry.
+- Fully offline, trivially backuppable, and instantly inspectable using the `sqlite3` CLI.
 
 ---
 
-## 7. Agent Instruction Protocol (`AGENTS.md` / `GEMINI.md`)
+## Agent Instruction Protocol
 
-To enable autonomous memory retrieval and persistence across coding agents (Antigravity, OpenCode, Claude Code, Cursor), add the following protocol to your project's `AGENTS.md` or global instructions (`~/.gemini/GEMINI.md` / `~/.config/opencode/AGENTS.md`):
+Copy this snippet into your project's `AGENTS.md` (or global `~/.gemini/GEMINI.md` / `~/.config/opencode/AGENTS.md`) so your agents automatically search and record memories:
 
 ```markdown
 ### Persistent Memory Protocol (memo-mcp)
 
-1. **Before starting complex architectural tasks, unfamiliar module refactoring, or troubleshooting obscure errors:**
-   - Identify current project context: project name (from `package.json`, root folder name, or git repo) and root path.
-   - Call `search_memory` using technical keywords, optionally including the project name if seeking project-specific context.
+1. **Before starting complex architectural tasks, unfamiliar refactoring, or troubleshooting obscure errors:**
+   - Identify current project context: project name (from `package.json`, root folder, or git repo) and root path.
+   - Call `search_memory` using natural language keywords or code symbols.
    - If the task relates to project origin, legacy decisions, or returns zero initial hits, re-run with `deep_history: true`.
    - Inspect the returned preview cards. If a card is directly relevant, call `get_entry_context(entry_id)` to review full code snippets, context, and trade-offs.
 
 2. **At the end of every completed milestone, bugfix, or structural decision:**
    - Call `append_memory` with explicit project identification:
-     - **Project Context:** Identify project name (e.g. from `package.json`, root folder name, or git repo) and workspace path.
-     - **Summary:** Prefix summary with `[<project-name>]` (e.g., `[memo-mcp] Configured SQLite WAL mode...`).
+     - **Project Context:** Identify project name (e.g. from `package.json`, root folder, or git repo) and workspace path.
+     - **Summary:** Prefix summary with `[<project-name>]` (e.g., `[my-project] Configured SQLite WAL mode...`).
      - **Body:** Begin body with a metadata header:
        ```markdown
        - **Project:** <project-name>
@@ -368,26 +147,136 @@ To enable autonomous memory retrieval and persistence across coding agents (Anti
 
 ---
 
-## 8. Development & Verification
+## MCP Tools & Resources API
 
-### Install Dependencies
-```bash
-npm install
+### Tools
+
+#### 1. `search_memory` (Stage 1)
+Searches entries using code-safe FTS5 BM25 ranking and exponential time decay. Multi-term natural language queries are evaluated with disjunctive ranking, ensuring relevant entries match even when terminology differs across entries.
+
+```json
+{
+  "query": "translation pipeline WhisperKit NLLB audio session",
+  "deep_history": false,
+  "limit": 5
+}
 ```
 
-### Build
+**Output:**
+```json
+[
+  {
+    "id": 51,
+    "type": "architecture",
+    "summary": "[free-ai-translation-ios-app] Implemented WhisperKitService and AudioLevelMonitor",
+    "tags": ["audio", "whisper", "free-ai-translation-ios-app"],
+    "age_days": 2,
+    "score": 9.99
+  }
+]
+```
+
+#### 2. `get_entry_context` (Stage 2)
+Deep retrieval of the complete Markdown narrative, code diffs, and context by ID.
+
+```json
+{
+  "entry_id": 51
+}
+```
+
+#### 3. `append_memory`
+Records an atomic insight or decision. Soft validation automatically coerces malformed inputs to `type: "note"` so agent writes never fail.
+
+```json
+{
+  "type": "decision",
+  "summary": "Adopted SQLite WAL mode with 5000ms busy_timeout for multi-agent writes",
+  "tags": ["sqlite", "wal", "concurrency"],
+  "body": "WAL mode enables concurrent readers while writing. Busy timeout handles lock contention across agent workers."
+}
+```
+
+#### 4. `get_active_tags`
+Returns the top 40 candidate tags from a 60-day rolling window to prevent vocabulary fragmentation across agents.
+
+---
+
+### Resources
+
+- `memo://tags/popular`: Exposes the top active tags as an MCP text resource to seed agent context on session boot.
+
+---
+
+## Under the Hood
+
+### Database Schema (WAL Mode)
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL CHECK(type IN ('decision', 'architecture', 'bugfix', 'note')),
+    summary TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_tags (
+    entry_id INTEGER NOT NULL,
+    keyword_id INTEGER NOT NULL,
+    PRIMARY KEY (entry_id, keyword_id),
+    FOREIGN KEY (entry_id) REFERENCES memory_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE CASCADE
+);
+
+-- Code-safe tokenization keeps symbols like @modelcontextprotocol/sdk or src/utils/auth.ts intact
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    entry_id UNINDEXED,
+    summary,
+    body,
+    tags,
+    tokenize = "unicode61 tokenchars '-_/@'"
+);
+```
+
+### Mathematical Scoring & Time-Decay
+
+In SQLite FTS5, the internal `bm25()` returns a negative score, where values closer to $-\infty$ indicate higher match quality:
+
+$$\text{Relevance}_{\text{raw}} = -1 \times \text{bm25}$$
+
+$$\Delta t_{\text{days}} = \frac{\text{now} - \text{created\_at}}{86,400,000\text{ ms}}$$
+
+$$\text{DecayMultiplier} = \begin{cases} 1.0 & \text{if } \text{deep\_history} = \text{true} \\ 1.0 & \text{if } \text{type} \in \{\text{'decision'}, \text{'architecture'}\} \\ (0.5)^{\frac{\Delta t_{\text{days}}}{30}} & \text{if } \text{type} \in \{\text{'bugfix'}, \text{'note'}\} \end{cases}$$
+
+$$\text{FinalScore} = \text{Relevance}_{\text{raw}} \times \text{DecayMultiplier}$$
+
+---
+
+## Local Development & Testing
+
 ```bash
+# Install dependencies
+npm install
+
+# Run test suite (68 tests across FTS5, decay, and MCP tools)
+npm test
+
+# Build TypeScript to dist/
 npm run build
 ```
 
-### Run Tests
-```bash
-npm test
-```
+---
 
-### Direct Execution
-```bash
-npm start
-# or directly with node
-node dist/index.js
-```
+## License
+
+[MIT](LICENSE)
