@@ -176,17 +176,19 @@ export function formatFtsQuery(query: string): string {
 
   const tokens: string[] = [];
   for (const match of matches) {
-    const raw = match.startsWith('"') && match.endsWith('"')
-      ? match.slice(1, -1)
-      : match;
+    const isQuoted = match.startsWith('"') && match.endsWith('"');
+    const raw = isQuoted ? match.slice(1, -1) : match;
 
-    const cleaned = raw.replace(/[^\w\-_/@.]/g, '');
+    const cleaned = isQuoted
+      ? raw.replace(/[^\w\-_/@. ]/g, '').trim().replace(/\s+/g, ' ')
+      : raw.replace(/[^\w\-_/@.]/g, '');
+
     if (cleaned.length > 0) {
       tokens.push(`"${cleaned}"`);
     }
   }
 
-  return tokens.join(' ');
+  return tokens.join(' OR ');
 }
 
 export function searchMemory(

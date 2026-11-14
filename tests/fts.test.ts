@@ -20,9 +20,9 @@ describe('FTS5 Search & Context Retrieval Pipeline', () => {
   });
 
   describe('formatFtsQuery', () => {
-    it('safely wraps single words and phrases in quotes', () => {
+    it('safely wraps single words and joins with OR', () => {
       expect(formatFtsQuery('sqlite')).toBe('"sqlite"');
-      expect(formatFtsQuery('sqlite wal')).toBe('"sqlite" "wal"');
+      expect(formatFtsQuery('sqlite wal')).toBe('"sqlite" OR "wal"');
     });
 
     it('handles code symbols (-_/@) without causing syntax errors', () => {
@@ -32,8 +32,9 @@ describe('FTS5 Search & Context Retrieval Pipeline', () => {
       expect(formatFtsQuery('node_next')).toBe('"node_next"');
     });
 
-    it('escapes internal quotes safely', () => {
-      expect(formatFtsQuery('hello "world"')).toBe('"hello" "world"');
+    it('preserves multi-word phrases in quotes and joins with OR', () => {
+      expect(formatFtsQuery('hello "world"')).toBe('"hello" OR "world"');
+      expect(formatFtsQuery('"audio session" pipeline')).toBe('"audio session" OR "pipeline"');
     });
 
     it('returns empty string for empty or whitespace-only queries', () => {
@@ -99,6 +100,39 @@ describe('FTS5 Search & Context Retrieval Pipeline', () => {
       const results = searchMemory(db, { query: '@modelcontextprotocol/sdk' });
       expect(results).toHaveLength(1);
       expect(results[0].id).toBe(e1.id);
+    });
+
+    it('matches entries partially on natural language multi-term queries', () => {
+      const e1 = insertMemoryEntry(db, {
+        type: 'architecture',
+        summary: 'Implemented WhisperKitService and AudioLevelMonitor',
+        body: 'Audio pipeline streaming with WhisperKit',
+        tags: ['audio', 'whisper'],
+      });
+
+      const e2 = insertMemoryEntry(db, {
+        type: 'architecture',
+        summary: 'Implemented SentenceSegmenter and TranslationPipelineService',
+        body: 'Translation pipeline for multilingual text',
+        tags: ['translation', 'pipeline'],
+      });
+
+      insertMemoryEntry(db, {
+        type: 'note',
+        summary: 'Unrelated database optimization',
+        body: 'Index creation on users table',
+        tags: ['database'],
+      });
+
+      // Natural language query where neither e1 nor e2 contains ALL terms
+      const results = searchMemory(db, {
+        query: 'translation pipeline WhisperKit NLLB audio session',
+      });
+
+      expect(results.length).toBeGreaterThanOrEqual(2);
+      const resultIds = results.map((r) => r.id);
+      expect(resultIds).toContain(e1.id);
+      expect(resultIds).toContain(e2.id);
     });
 
     it('applies time decay when deep_history is false, demoting older notes', () => {
